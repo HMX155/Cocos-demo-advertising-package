@@ -1,11 +1,13 @@
 ﻿// UTF-8 BOM
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const INPUT_DIR = path.join(ROOT, 'web-mobile');
 const OUTPUT_DIR = path.join(ROOT, 'output');
 const OUTPUT_HTML = path.join(OUTPUT_DIR, 'index.html');
+const MINIFY_JS = process.env.MINIFY_JS !== '0';
 
 function readText(filePath) {
   let text = fs.readFileSync(filePath, 'utf8');
@@ -21,6 +23,48 @@ function escapeScriptContent(text) {
 
 function safeJson(obj) {
   return JSON.stringify(obj).replace(/</g, '\\u003C');
+}
+
+function loadTerser() {
+  try {
+    return require('terser');
+  } catch (err) {
+    return null;
+  }
+}
+
+function minifyJsWithNpx(text, label) {
+  const args = ['-y', 'terser', '--compress', '--mangle', '--comments', 'false'];
+  const result = spawnSync('npx', args, {
+    input: text,
+    encoding: 'utf8',
+    maxBuffer: 200 * 1024 * 1024
+  });
+  if (result.error) {
+    throw new Error(`minify failed (${label}): ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const stderr = (result.stderr || '').trim();
+    throw new Error(`minify failed (${label}): ${stderr || 'npx terser error'}`);
+  }
+  return result.stdout || text;
+}
+
+async function minifyJs(text, label) {
+  if (!MINIFY_JS) return text;
+  const terser = loadTerser();
+  if (terser && typeof terser.minify === 'function') {
+    const result = await terser.minify(text, {
+      compress: true,
+      mangle: true,
+      format: { comments: false }
+    });
+    if (!result || !result.code) {
+      throw new Error(`minify failed (${label}): empty output`);
+    }
+    return result.code;
+  }
+  return minifyJsWithNpx(text, label);
 }
 
 function walkFiles(dir) {
@@ -114,32 +158,32 @@ function readJs(relPath) {
   return readText(path.join(INPUT_DIR, relPath));
 }
 
-function main() {
+async function main() {
   if (!fs.existsSync(INPUT_DIR)) {
     console.error('Input not found:', INPUT_DIR);
     process.exit(1);
   }
 
   const styleCss = readText(path.join(INPUT_DIR, 'style.css'));
-  const polyfills = readJs(path.join('src', 'polyfills.bundle.js'));
-  const systemjs = readJs(path.join('src', 'system.bundle.js'));
+  const polyfills = await minifyJs(readJs(path.join('src', 'polyfills.bundle.js')), 'polyfills.bundle.js');
+  const systemjs = await minifyJs(readJs(path.join('src', 'system.bundle.js')), 'system.bundle.js');
 
   const settingsText = readText(path.join(INPUT_DIR, 'src', 'settings.json'));
 
   const { resMap, bundleNames } = buildResMap();
   const wasmMap = buildWasmMap();
 
-  const loadCCIndex = buildLoadCCIndex();
+  const loadCCIndex = await minifyJs(buildLoadCCIndex(), 'loadCCIndex');
 
-  const indexJs = readText(path.join(INPUT_DIR, 'index.js'));
-  const bundleJs = readText(path.join(INPUT_DIR, 'src', 'chunks', 'bundle.js'));
-  const ccJs = readText(path.join(INPUT_DIR, 'cocos-js', 'cc.js'));
+  const indexJs = await minifyJs(readText(path.join(INPUT_DIR, 'index.js')), 'index.js');
+  const bundleJs = await minifyJs(readText(path.join(INPUT_DIR, 'src', 'chunks', 'bundle.js')), 'bundle.js');
+  const ccJs = await minifyJs(readText(path.join(INPUT_DIR, 'cocos-js', 'cc.js')), 'cc.js');
 
   const spineFiles = fs.readdirSync(path.join(INPUT_DIR, 'cocos-js'))
     .filter(name => name.startsWith('spine') && name.endsWith('.js'))
     .sort();
 
-  const spineLoaders = spineFiles.map((name) => {
+  const spineLoaders = await Promise.all(spineFiles.map(async (name) => {
     const fnName = 'load' + name.replace(/[^a-zA-Z0-9]/g, '');
     let js = readText(path.join(INPUT_DIR, 'cocos-js', name));
     const memMatch = js.match(/assets\/spine\.js\.mem-[^"']+\.bin/);
@@ -147,8 +191,9 @@ function main() {
       const memPath = memMatch[0];
       js = `System.register([],(function(e){\"use strict\";return{execute:function(){e(\"default\",window.wasmMap[${JSON.stringify(memPath)}])}}}));`;
     }
+    js = await minifyJs(js, name);
     return { name, fnName, js };
-  });
+  }));
 
   const html = `<!DOCTYPE html>
 <html>
@@ -629,4 +674,7 @@ function start(){
   console.log('written', OUTPUT_HTML);
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
