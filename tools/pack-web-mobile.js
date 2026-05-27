@@ -8,6 +8,40 @@ const INPUT_DIR = path.join(ROOT, 'web-mobile');
 const OUTPUT_DIR = path.join(ROOT, 'output');
 const OUTPUT_HTML = path.join(OUTPUT_DIR, 'index.html');
 const MINIFY_JS = process.env.MINIFY_JS !== '0';
+const EXTREME_PACK = process.env.EXTREME_PACK !== '0';
+const EXTREME_PACK_MIN_BYTES = 1024;
+
+function log(message) {
+  console.log(`[pack] ${message}`);
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatMB(bytes) {
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+async function step(label, fn) {
+  const started = Date.now();
+  log(`开始 ${label}`);
+  try {
+    const result = await fn();
+    log(`完成 ${label} (${formatDuration(Date.now() - started)})`);
+    return result;
+  } catch (err) {
+    log(`失败 ${label} (${formatDuration(Date.now() - started)})`);
+    throw err;
+  }
+}
 
 function readText(filePath) {
   let text = fs.readFileSync(filePath, 'utf8');
@@ -23,6 +57,85 @@ function escapeScriptContent(text) {
 
 function safeJson(obj) {
   return JSON.stringify(obj).replace(/</g, '\\u003C');
+}
+
+function lzwBase64(text) {
+  const input = Buffer.from(text, 'utf8');
+  const dict = new Map();
+  for (let i = 0; i < 256; i++) {
+    dict.set(String.fromCharCode(i), i);
+  }
+  const codes = [];
+  let phrase = '';
+  let nextCode = 256;
+  for (let i = 0; i < input.length; i++) {
+    const ch = String.fromCharCode(input[i]);
+    const combo = phrase + ch;
+    if (dict.has(combo)) {
+      phrase = combo;
+    } else {
+      codes.push(dict.get(phrase));
+      dict.set(combo, nextCode++);
+      phrase = ch;
+    }
+  }
+  if (phrase) {
+    codes.push(dict.get(phrase));
+  }
+  let maxCode = 0;
+  for (const code of codes) {
+    if (code > maxCode) maxCode = code;
+  }
+  const bits = Math.max(9, Math.ceil(Math.log2(maxCode + 1)));
+  const bytes = [];
+  let bitBuffer = 0;
+  let bitCount = 0;
+  for (const code of codes) {
+    bitBuffer += code * Math.pow(2, bitCount);
+    bitCount += bits;
+    while (bitCount >= 8) {
+      bytes.push(bitBuffer & 255);
+      bitBuffer = Math.floor(bitBuffer / 256);
+      bitCount -= 8;
+    }
+  }
+  if (bitCount > 0) {
+    bytes.push(bitBuffer & 255);
+  }
+  return `${bits},${codes.length}:${Buffer.from(bytes).toString('base64')}`;
+}
+
+function plainScript(name, js) {
+  const rawSize = Buffer.byteLength(js, 'utf8');
+  return { name, js, packed: false, rawSize, packedSize: rawSize };
+}
+
+function packScript(name, js) {
+  const rawSize = Buffer.byteLength(js, 'utf8');
+  if (!EXTREME_PACK || rawSize < EXTREME_PACK_MIN_BYTES) {
+    return plainScript(name, js);
+  }
+  const data = lzwBase64(js);
+  const packedSize = Buffer.byteLength(data, 'utf8');
+  if (packedSize >= rawSize) {
+    log(`极限压缩跳过 ${name}: ${formatMB(rawSize)} -> ${formatMB(packedSize)}，未变小`);
+    return plainScript(name, js);
+  }
+  return { name, data, packed: true, rawSize, packedSize };
+}
+
+function renderScriptFunction(fnName, entry) {
+  if (entry.packed) {
+    return `function ${fnName}(){\n  return runPackedScript(${JSON.stringify(entry.name)});\n}`;
+  }
+  return `function ${fnName}(){\n${escapeScriptContent(entry.js)}\n  return true;\n}`;
+}
+
+function renderScriptBody(entry) {
+  if (entry.packed) {
+    return `  return runPackedScript(${JSON.stringify(entry.name)});`;
+  }
+  return `${escapeScriptContent(entry.js)}\n  return true;`;
 }
 
 function loadTerser() {
@@ -51,8 +164,15 @@ function minifyJsWithNpx(text, label) {
 }
 
 async function minifyJs(text, label) {
-  if (!MINIFY_JS) return text;
+  const inputSize = Buffer.byteLength(text, 'utf8');
+  if (!MINIFY_JS) {
+    log(`跳过压缩 ${label} (${formatBytes(inputSize)})`);
+    return text;
+  }
+  const started = Date.now();
+  log(`压缩 ${label} (${formatBytes(inputSize)})`);
   const terser = loadTerser();
+  let code;
   if (terser && typeof terser.minify === 'function') {
     const result = await terser.minify(text, {
       compress: true,
@@ -62,9 +182,13 @@ async function minifyJs(text, label) {
     if (!result || !result.code) {
       throw new Error(`minify failed (${label}): empty output`);
     }
-    return result.code;
+    code = result.code;
+  } else {
+    log(`本地 terser 不存在，使用 npx terser 压缩 ${label}`);
+    code = minifyJsWithNpx(text, label);
   }
-  return minifyJsWithNpx(text, label);
+  log(`压缩完成 ${label}: ${formatBytes(inputSize)} -> ${formatBytes(Buffer.byteLength(code, 'utf8'))} (${formatDuration(Date.now() - started)})`);
+  return code;
 }
 
 function walkFiles(dir) {
@@ -158,32 +282,56 @@ function readJs(relPath) {
   return readText(path.join(INPUT_DIR, relPath));
 }
 
+function buildSettings() {
+  const settings = JSON.parse(readText(path.join(INPUT_DIR, 'src', 'settings.json')));
+  const effectPath = settings.rendering && settings.rendering.effectSettingsPath;
+  if (effectPath) {
+    const filePath = path.join(INPUT_DIR, effectPath);
+    if (fs.existsSync(filePath)) {
+      const ext = path.extname(filePath).toLowerCase();
+      const b64 = fs.readFileSync(filePath).toString('base64');
+      settings.rendering.effectSettingsPath = `data:${mimeFor(ext)};base64,${b64}`;
+    }
+  }
+  return settings;
+}
+
 async function main() {
   if (!fs.existsSync(INPUT_DIR)) {
     console.error('Input not found:', INPUT_DIR);
     process.exit(1);
   }
 
-  const styleCss = readText(path.join(INPUT_DIR, 'style.css'));
-  const polyfills = await minifyJs(readJs(path.join('src', 'polyfills.bundle.js')), 'polyfills.bundle.js');
-  const systemjs = await minifyJs(readJs(path.join('src', 'system.bundle.js')), 'system.bundle.js');
+  const totalStarted = Date.now();
+  log(`输入目录: ${INPUT_DIR}`);
+  log(`输出文件: ${OUTPUT_HTML}`);
+  log(`JS 压缩: ${MINIFY_JS ? '开启' : '关闭'}`);
+  log(`极限压缩: ${EXTREME_PACK ? '开启' : '关闭'}`);
 
-  const settingsText = readText(path.join(INPUT_DIR, 'src', 'settings.json'));
+  const styleCss = await step('读取 style.css', () => readText(path.join(INPUT_DIR, 'style.css')));
+  const polyfills = await step('处理 polyfills.bundle.js', () => minifyJs(readJs(path.join('src', 'polyfills.bundle.js')), 'polyfills.bundle.js'));
+  const systemjs = await step('处理 system.bundle.js', () => minifyJs(readJs(path.join('src', 'system.bundle.js')), 'system.bundle.js'));
 
-  const { resMap, bundleNames } = buildResMap();
-  const wasmMap = buildWasmMap();
+  const settings = await step('处理 settings.json', () => buildSettings());
 
-  const loadCCIndex = await minifyJs(buildLoadCCIndex(), 'loadCCIndex');
+  const { resMap, bundleNames } = await step('内联 assets 资源', () => buildResMap());
+  log(`资源 bundle: ${bundleNames.join(', ') || '无'}, 文件数: ${Object.keys(resMap).length}`);
+  const wasmMap = await step('内联 wasm/bin 资源', () => buildWasmMap());
+  log(`wasm/bin 文件数: ${Object.keys(wasmMap).length}`);
 
-  const indexJs = await minifyJs(readText(path.join(INPUT_DIR, 'index.js')), 'index.js');
-  const bundleJs = await minifyJs(readText(path.join(INPUT_DIR, 'src', 'chunks', 'bundle.js')), 'bundle.js');
-  const ccJs = await minifyJs(readText(path.join(INPUT_DIR, 'cocos-js', 'cc.js')), 'cc.js');
+  const loadCCIndex = packScript('bundle-index.js', await step('处理 bundle index.js', () => minifyJs(buildLoadCCIndex(), 'loadCCIndex')));
+
+  const indexJs = packScript('index.js', await step('处理 index.js', () => minifyJs(readText(path.join(INPUT_DIR, 'index.js')), 'index.js')));
+  const bundleJs = packScript('bundle.js', await step('处理 bundle.js', () => minifyJs(readText(path.join(INPUT_DIR, 'src', 'chunks', 'bundle.js')), 'bundle.js')));
+  const ccJs = packScript('cc.js', await step('处理 cc.js', () => minifyJs(readText(path.join(INPUT_DIR, 'cocos-js', 'cc.js')), 'cc.js')));
 
   const spineFiles = fs.readdirSync(path.join(INPUT_DIR, 'cocos-js'))
     .filter(name => name.startsWith('spine') && name.endsWith('.js'))
     .sort();
 
-  const spineLoaders = await Promise.all(spineFiles.map(async (name) => {
+  log(`spine loader 文件数: ${spineFiles.length}`);
+  log('spine loader 保持同步内联，避免 System.register 并发加载顺序被打乱');
+  const spineLoaders = await step('处理 spine loader', () => Promise.all(spineFiles.map(async (name) => {
     const fnName = 'load' + name.replace(/[^a-zA-Z0-9]/g, '');
     let js = readText(path.join(INPUT_DIR, 'cocos-js', name));
     const memMatch = js.match(/assets\/spine\.js\.mem-[^"']+\.bin/);
@@ -192,8 +340,14 @@ async function main() {
       js = `System.register([],(function(e){\"use strict\";return{execute:function(){e(\"default\",window.wasmMap[${JSON.stringify(memPath)}])}}}));`;
     }
     js = await minifyJs(js, name);
-    return { name, fnName, js };
-  }));
+    return { name, fnName, script: plainScript(name, js) };
+  })));
+  const packedEntries = [loadCCIndex, indexJs, bundleJs, ccJs].filter(s => s.packed);
+  if (packedEntries.length) {
+    packedEntries.forEach((entry) => {
+      log(`极限压缩 ${entry.name}: ${formatMB(entry.rawSize)} -> ${formatMB(entry.packedSize)}`);
+    });
+  }
 
   const html = `<!DOCTYPE html>
 <html>
@@ -256,12 +410,12 @@ ${escapeScriptContent(systemjs)}
 
   <script>
     function loadCCIndex(){
-${escapeScriptContent(loadCCIndex)}
+${renderScriptBody(loadCCIndex)}
     }
   </script>
 
   <script>
-    window._CCSettings = ${settingsText};
+    window._CCSettings = ${safeJson(settings)};
   </script>
 
   <script>
@@ -512,7 +666,7 @@ window.hook = function (cc) {
 
   <script>
 function loadMyBundle(){
-${escapeScriptContent(bundleJs)}
+${renderScriptBody(bundleJs)}
 }
 
 function loadApplication(){
@@ -596,15 +750,70 @@ function loadApplication(){
   });
 }
 
+window.packedScripts = ${safeJson(Object.fromEntries(packedEntries.map(entry => [entry.name, entry.data])))};
+
+function packedDataToCodes(data) {
+  var split = data.indexOf(':');
+  var header = data.slice(0, split).split(',');
+  var bits = Number(header[0]);
+  var codeCount = Number(header[1]);
+  var binary = atob(data.slice(split + 1));
+  var codes = [];
+  var bitBuffer = 0;
+  var bitCount = 0;
+  var pow = Math.pow(2, bits);
+  for (var i = 0; i < binary.length; i++) {
+    bitBuffer += binary.charCodeAt(i) * Math.pow(2, bitCount);
+    bitCount += 8;
+    while (bitCount >= bits) {
+      codes.push(bitBuffer % pow);
+      if (codes.length === codeCount) return codes;
+      bitBuffer = Math.floor(bitBuffer / pow);
+      bitCount -= bits;
+    }
+  }
+  return codes;
+}
+
+function decodePackedScript(data) {
+  var codes = packedDataToCodes(data);
+  var dict = new Array(256);
+  for (var i = 0; i < 256; i++) {
+    dict[i] = String.fromCharCode(i);
+  }
+  var oldPhrase = String.fromCharCode(codes[0]);
+  var out = [oldPhrase];
+  var nextCode = 256;
+  for (var j = 1; j < codes.length; j++) {
+    var code = codes[j];
+    var phrase = code < dict.length ? dict[code] : oldPhrase + oldPhrase.charAt(0);
+    out.push(phrase);
+    dict[nextCode++] = oldPhrase + phrase.charAt(0);
+    oldPhrase = phrase;
+  }
+  var binary = out.join('');
+  var bytes = new Uint8Array(binary.length);
+  for (var k = 0; k < binary.length; k++) {
+    bytes[k] = binary.charCodeAt(k);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function runPackedScript(name) {
+  var code = decodePackedScript(window.packedScripts[name]);
+  (0, eval)(code);
+  return true;
+}
+
 function loadIndex(){
-${escapeScriptContent(indexJs)}
+${renderScriptBody(indexJs)}
 }
 
 function loadCcJs(){
-${escapeScriptContent(ccJs)}
+${renderScriptBody(ccJs)}
 }
 
-${spineLoaders.map(s => `function ${s.fnName}(){\n${escapeScriptContent(s.js)}\n}`).join('\n\n')}
+${spineLoaders.map(s => renderScriptFunction(s.fnName, s.script)).join('\n\n')}
 
 window.jsList = ${safeJson([
     'index.js',
@@ -640,15 +849,11 @@ System.constructor.prototype.instantiate = function (url, parentUrl) {
   var loaded = false;
   for (var i = 0;i < window.jsList.length;i++){
     if (url.indexOf(window.jsList[i]) > 0){
-      var result = load(window.jsList[i]);
-      if (result) {
-        loaded = true;
-        break;
-      }
+      loaded = load(window.jsList[i]);
+      break;
     }
   }
-  if (loaded) return Promise.resolve(System.getRegister());
-  else return Promise.resolve(existingHook.call(this, url, parentUrl));
+  return loaded ? System.getRegister() : existingHook.call(this, url, parentUrl);
 };
 
 function start(){
@@ -671,7 +876,10 @@ function start(){
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   fs.writeFileSync(OUTPUT_HTML, '\uFEFF' + html, 'utf8');
-  console.log('written', OUTPUT_HTML);
+  const outputSize = fs.statSync(OUTPUT_HTML).size;
+  log(`写入 ${OUTPUT_HTML}`);
+  log(`产物大小: ${formatMB(outputSize)}`);
+  log(`全部完成 (${formatDuration(Date.now() - totalStarted)})`);
 }
 
 main().catch((err) => {

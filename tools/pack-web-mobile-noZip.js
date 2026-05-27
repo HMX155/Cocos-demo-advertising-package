@@ -114,6 +114,20 @@ function readJs(relPath) {
   return readText(path.join(INPUT_DIR, relPath));
 }
 
+function buildSettings() {
+  const settings = JSON.parse(readText(path.join(INPUT_DIR, 'src', 'settings.json')));
+  const effectPath = settings.rendering && settings.rendering.effectSettingsPath;
+  if (effectPath) {
+    const filePath = path.join(INPUT_DIR, effectPath);
+    if (fs.existsSync(filePath)) {
+      const ext = path.extname(filePath).toLowerCase();
+      const b64 = fs.readFileSync(filePath).toString('base64');
+      settings.rendering.effectSettingsPath = `data:${mimeFor(ext)};base64,${b64}`;
+    }
+  }
+  return settings;
+}
+
 function main() {
   if (!fs.existsSync(INPUT_DIR)) {
     console.error('Input not found:', INPUT_DIR);
@@ -124,7 +138,7 @@ function main() {
   const polyfills = readJs(path.join('src', 'polyfills.bundle.js'));
   const systemjs = readJs(path.join('src', 'system.bundle.js'));
 
-  const settingsText = readText(path.join(INPUT_DIR, 'src', 'settings.json'));
+  const settings = buildSettings();
 
   const { resMap, bundleNames } = buildResMap();
   const wasmMap = buildWasmMap();
@@ -216,7 +230,7 @@ ${escapeScriptContent(loadCCIndex)}
   </script>
 
   <script>
-    window._CCSettings = ${settingsText};
+    window._CCSettings = ${safeJson(settings)};
   </script>
 
   <script>
