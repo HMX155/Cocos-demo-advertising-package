@@ -1,6 +1,7 @@
 ﻿// UTF-8 BOM
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -41,6 +42,46 @@ async function step(label, fn) {
     log(`失败 ${label} (${formatDuration(Date.now() - started)})`);
     throw err;
   }
+}
+
+function askQuestion(question) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
+async function selectPlatform() {
+  const envPlatform = (process.env.PACK_PLATFORM || '').trim().toLowerCase();
+  if (envPlatform === 'default' || envPlatform === '1') {
+    return 'default';
+  }
+  if (envPlatform === 'facebook' || envPlatform === '2') {
+    return 'facebook';
+  }
+  if (envPlatform === 'google' || envPlatform === '3') {
+    return 'google';
+  }
+  console.log('请选择打包平台：');
+  console.log('1. MTG');
+  console.log('2. facebook');
+  console.log('3. 谷歌');
+  const answer = (await askQuestion('请输入序号，直接回车默认选择 1（MTG）：')).trim();
+  if (answer === '2') return 'facebook';
+  if (answer === '3') return 'google';
+  return 'default';
+}
+
+function platformLabel(platform) {
+  if (platform === 'facebook') return 'facebook';
+  if (platform === 'google') return '谷歌';
+  return 'MTG';
 }
 
 function readText(filePath) {
@@ -136,6 +177,292 @@ function renderScriptBody(entry) {
     return `  return runPackedScript(${JSON.stringify(entry.name)});`;
   }
   return `${escapeScriptContent(entry.js)}\n  return true;`;
+}
+
+function renderHeadPlatformScripts(platform) {
+  if (platform !== 'google') {
+    return '';
+  }
+  return `
+  <script type="text/javascript" src="https://tpc.googlesyndication.com/pagead/gadgets/html5/api/exitapi.js"> </script>
+`;
+}
+
+function renderGoogleRuntimeShim(platform) {
+  if (platform !== 'google') {
+    return '';
+  }
+  return `
+  <script>
+    window.install = function () {
+      if (window.ExitApi && typeof window.ExitApi.exit === 'function') {
+        window.ExitApi.exit();
+        return;
+      }
+      console.error('ExitApi.exit is not available');
+    };
+  </script>
+`;
+}
+
+function renderFacebookRuntimeShim(platform) {
+  if (platform !== 'facebook') {
+    return '';
+  }
+  return `
+  <script>
+    (function installFacebookRuntimeGuards() {
+      function dataUriToArrayBuffer(dataURI) {
+        var comma = dataURI.indexOf(',');
+        var meta = dataURI.slice(0, comma);
+        var data = dataURI.slice(comma + 1);
+        var binary = meta.indexOf(';base64') >= 0 ? atob(data) : decodeURIComponent(data);
+        var bytes = new Uint8Array(binary.length);
+        for (var i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes.buffer;
+      }
+
+      function makeInlineBinaryResponse(dataURI) {
+        var buffer = dataUriToArrayBuffer(dataURI);
+        return new Response(buffer, {
+          status: 200,
+          headers: { 'Content-Type': 'application/octet-stream' }
+        });
+      }
+
+      function resolveInlineBinary(input) {
+        if (!input) return '';
+        var key = String(input);
+        if (key.indexOf('data:') === 0) return key;
+        var keys = [key];
+        try {
+          keys.push(new URL(key, window.location.href).pathname.replace(/^\\/+/, ''));
+        } catch (err) {}
+        var name = key.split('?')[0].split('#')[0].split('/').pop();
+        if (name) {
+          keys.push(name);
+          if (name.indexOf('spine.js.mem') === 0) {
+            keys.push('spine.js.mem');
+            keys.push('assets/spine.js.mem');
+          }
+          if (name.indexOf('spine.wasm') === 0) {
+            keys.push('spine.wasm');
+            keys.push('assets/spine.wasm');
+          }
+        }
+        for (var i = 0; i < keys.length; i++) {
+          var candidate = String(keys[i]).split('?')[0].split('#')[0].replace(/^\\/+/, '');
+          if (!candidate) continue;
+          if (window.wasmMap && window.wasmMap[candidate]) {
+            return window.wasmMap[candidate];
+          }
+          var assetIndex = candidate.lastIndexOf('assets/');
+          if (assetIndex >= 0) {
+            candidate = candidate.slice(assetIndex);
+            if (window.wasmMap && window.wasmMap[candidate]) {
+              return window.wasmMap[candidate];
+            }
+          }
+        }
+        return '';
+      }
+
+      window.fbPlayableCTAClick = function () {
+        if (window.FbPlayableAd && typeof window.FbPlayableAd.onCTAClick === 'function') {
+          window.FbPlayableAd.onCTAClick();
+        }
+      };
+
+      var nativeFetch = window.fetch;
+      if (typeof nativeFetch === 'function') {
+        window.fetch = function (input, init) {
+          var url = typeof input === 'string' ? input : input && input.url;
+          var wasmValue = resolveInlineBinary(url);
+          if (wasmValue) {
+            return Promise.resolve(makeInlineBinaryResponse(wasmValue));
+          }
+          return nativeFetch.apply(this, arguments);
+        };
+      }
+
+      var NativeXMLHttpRequest = window.XMLHttpRequest;
+      if (typeof NativeXMLHttpRequest === 'function') {
+        window.XMLHttpRequest = function () {
+          var xhr = new NativeXMLHttpRequest();
+          var method = 'GET';
+          var url = '';
+          var async = true;
+          var headers = {};
+          var intercepted = false;
+          var listeners = {};
+          var responseType = '';
+          var response = null;
+          var responseText = '';
+          var readyState = 0;
+          var status = 0;
+          var statusText = '';
+          var eventHandlers = {};
+
+          function notify(type) {
+            var event = { type: type, target: proxy, currentTarget: proxy };
+            var handler = eventHandlers[type];
+            if (typeof handler === 'function') handler.call(proxy, event);
+            var list = listeners[type] || [];
+            for (var i = 0; i < list.length; i++) {
+              list[i].call(proxy, event);
+            }
+          }
+
+          function setReadyState(value) {
+            readyState = value;
+            notify('readystatechange');
+          }
+
+          function completeWithInlineData(dataURI) {
+            intercepted = true;
+            status = 200;
+            statusText = 'OK';
+            setReadyState(2);
+            setReadyState(3);
+            var buffer = dataUriToArrayBuffer(dataURI);
+            if (responseType === 'blob') {
+              response = new Blob([buffer], { type: 'application/octet-stream' });
+            } else if (responseType === 'text' || responseType === '') {
+              responseText = atob(dataURI.split(',')[1]);
+              response = responseText;
+            } else {
+              response = buffer;
+            }
+            setReadyState(4);
+            notify('load');
+            notify('loadend');
+          }
+
+          var proxy = {
+            open: function (nextMethod, nextUrl, nextAsync) {
+              method = nextMethod || 'GET';
+              url = nextUrl || '';
+              async = nextAsync !== false;
+              var dataURI = resolveInlineBinary(url);
+              intercepted = !!dataURI;
+              if (!intercepted) {
+                return xhr.open.apply(xhr, arguments);
+              }
+              setReadyState(1);
+            },
+            send: function () {
+              var dataURI = resolveInlineBinary(url);
+              if (!dataURI) {
+                return xhr.send.apply(xhr, arguments);
+              }
+              var run = function () { completeWithInlineData(dataURI); };
+              if (async) setTimeout(run, 0);
+              else run();
+            },
+            abort: function () {
+              if (!intercepted) return xhr.abort();
+              status = 0;
+              statusText = '';
+              notify('abort');
+              notify('loadend');
+            },
+            setRequestHeader: function (name, value) {
+              headers[name] = value;
+              if (!intercepted) xhr.setRequestHeader(name, value);
+            },
+            getResponseHeader: function (name) {
+              if (!intercepted) return xhr.getResponseHeader(name);
+              return String(name).toLowerCase() === 'content-type' ? 'application/octet-stream' : null;
+            },
+            getAllResponseHeaders: function () {
+              if (!intercepted) return xhr.getAllResponseHeaders();
+              return 'content-type: application/octet-stream\\r\\n';
+            },
+            overrideMimeType: function (mime) {
+              if (!intercepted && xhr.overrideMimeType) xhr.overrideMimeType(mime);
+            },
+            addEventListener: function (type, handler) {
+              if (!listeners[type]) listeners[type] = [];
+              listeners[type].push(handler);
+              if (!intercepted) xhr.addEventListener(type, handler);
+            },
+            removeEventListener: function (type, handler) {
+              var list = listeners[type] || [];
+              var index = list.indexOf(handler);
+              if (index >= 0) list.splice(index, 1);
+              if (!intercepted) xhr.removeEventListener(type, handler);
+            },
+            dispatchEvent: function (event) {
+              if (!intercepted) return xhr.dispatchEvent(event);
+              notify(event.type);
+              return true;
+            }
+          };
+
+          Object.defineProperties(proxy, {
+            readyState: { get: function () { return intercepted ? readyState : xhr.readyState; } },
+            status: { get: function () { return intercepted ? status : xhr.status; } },
+            statusText: { get: function () { return intercepted ? statusText : xhr.statusText; } },
+            response: { get: function () { return intercepted ? response : xhr.response; } },
+            responseText: { get: function () { return intercepted ? responseText : xhr.responseText; } },
+            responseType: {
+              get: function () { return intercepted ? responseType : xhr.responseType; },
+              set: function (value) {
+                responseType = value || '';
+                if (!intercepted) xhr.responseType = value;
+              }
+            },
+            timeout: {
+              get: function () { return xhr.timeout; },
+              set: function (value) { xhr.timeout = value; }
+            },
+            withCredentials: {
+              get: function () { return xhr.withCredentials; },
+              set: function (value) { xhr.withCredentials = value; }
+            }
+          });
+
+          ['readystatechange', 'load', 'error', 'abort', 'loadend', 'progress', 'timeout'].forEach(function (type) {
+            Object.defineProperty(proxy, 'on' + type, {
+              get: function () { return eventHandlers[type] || null; },
+              set: function (handler) {
+                eventHandlers[type] = handler;
+                xhr['on' + type] = handler;
+              }
+            });
+          });
+
+          return proxy;
+        };
+      }
+
+      function installSafeGamepad(name) {
+        if (!(name in navigator)) return;
+        try {
+          if (typeof navigator[name] === 'function') {
+            navigator[name]();
+          }
+        } catch (err) {
+          try {
+            Object.defineProperty(navigator, name, {
+              configurable: true,
+              value: function () { return []; }
+            });
+          } catch (defineErr) {}
+        }
+      }
+
+      installSafeGamepad('getGamepads');
+      installSafeGamepad('webkitGetGamepads');
+    })();
+  </script>
+`;
+}
+
+function renderBodyPlatformShim(platform) {
+  return `${renderFacebookRuntimeShim(platform)}${renderGoogleRuntimeShim(platform)}`;
 }
 
 function loadTerser() {
@@ -249,7 +576,13 @@ function buildResMap() {
   return { resMap, bundleNames };
 }
 
-function buildWasmMap() {
+function addWasmAlias(wasmMap, key, value) {
+  if (key && !wasmMap[key]) {
+    wasmMap[key] = value;
+  }
+}
+
+function buildWasmMap(platform) {
   const wasmRoot = path.join(INPUT_DIR, 'cocos-js', 'assets');
   if (!fs.existsSync(wasmRoot)) return {};
   const files = walkFiles(wasmRoot);
@@ -261,7 +594,24 @@ function buildWasmMap() {
     const key = `assets/${rel}`;
     const bin = fs.readFileSync(filePath);
     const b64 = bin.toString('base64');
-    wasmMap[key] = `data:${mimeFor(ext)};base64,${b64}`;
+    const value = `data:${mimeFor(ext)};base64,${b64}`;
+    wasmMap[key] = value;
+    if (platform === 'facebook') {
+      const baseName = path.basename(filePath);
+      addWasmAlias(wasmMap, rel, value);
+      addWasmAlias(wasmMap, baseName, value);
+      addWasmAlias(wasmMap, `cocos-js/assets/${rel}`, value);
+      if (baseName.startsWith('spine.js.mem')) {
+        addWasmAlias(wasmMap, 'spine.js.mem', value);
+        addWasmAlias(wasmMap, 'assets/spine.js.mem', value);
+        addWasmAlias(wasmMap, 'cocos-js/assets/spine.js.mem', value);
+      }
+      if (baseName.startsWith('spine.wasm')) {
+        addWasmAlias(wasmMap, 'spine.wasm', value);
+        addWasmAlias(wasmMap, 'assets/spine.wasm', value);
+        addWasmAlias(wasmMap, 'cocos-js/assets/spine.wasm', value);
+      }
+    }
   }
   return wasmMap;
 }
@@ -302,9 +652,11 @@ async function main() {
     process.exit(1);
   }
 
+  const platform = await selectPlatform();
   const totalStarted = Date.now();
   log(`输入目录: ${INPUT_DIR}`);
   log(`输出文件: ${OUTPUT_HTML}`);
+  log(`打包平台: ${platformLabel(platform)}`);
   log(`JS 压缩: ${MINIFY_JS ? '开启' : '关闭'}`);
   log(`极限压缩: ${EXTREME_PACK ? '开启' : '关闭'}`);
 
@@ -316,7 +668,7 @@ async function main() {
 
   const { resMap, bundleNames } = await step('内联 assets 资源', () => buildResMap());
   log(`资源 bundle: ${bundleNames.join(', ') || '无'}, 文件数: ${Object.keys(resMap).length}`);
-  const wasmMap = await step('内联 wasm/bin 资源', () => buildWasmMap());
+  const wasmMap = await step('内联 wasm/bin 资源', () => buildWasmMap(platform));
   log(`wasm/bin 文件数: ${Object.keys(wasmMap).length}`);
 
   const loadCCIndex = packScript('bundle-index.js', await step('处理 bundle index.js', () => minifyJs(buildLoadCCIndex(), 'loadCCIndex')));
@@ -355,6 +707,7 @@ async function main() {
   <meta charset="utf-8">
   <title>Playable Ads</title>
   <meta name="viewport" content="width=device-width,user-scalable=no,initial-scale=1, minimum-scale=1,maximum-scale=1" />
+${renderHeadPlatformScripts(platform)}
   <style>
     #loading-zone {
       position: absolute;
@@ -864,6 +1217,7 @@ function start(){
   <script>
     window.progress.value = 35;
   </script>
+${renderBodyPlatformShim(platform)}
 
   <script>
     window.addEventListener("DOMContentLoaded", start);
