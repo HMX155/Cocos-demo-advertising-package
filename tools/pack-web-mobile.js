@@ -68,19 +68,25 @@ async function selectPlatform() {
   if (envPlatform === 'google' || envPlatform === '3') {
     return 'google';
   }
+  if (envPlatform === 'tiktok' || envPlatform === '4') {
+    return 'tiktok';
+  }
   console.log('请选择打包平台：');
   console.log('1. MTG');
   console.log('2. facebook');
   console.log('3. 谷歌');
+  console.log('4. TikTok');
   const answer = (await askQuestion('请输入序号，直接回车默认选择 1（MTG）：')).trim();
   if (answer === '2') return 'facebook';
   if (answer === '3') return 'google';
+  if (answer === '4') return 'tiktok';
   return 'default';
 }
 
 function platformLabel(platform) {
   if (platform === 'facebook') return 'facebook';
   if (platform === 'google') return '谷歌';
+  if (platform === 'tiktok') return 'TikTok';
   return 'MTG';
 }
 
@@ -185,6 +191,15 @@ function renderHeadPlatformScripts(platform) {
   }
   return `
   <script type="text/javascript" src="https://tpc.googlesyndication.com/pagead/gadgets/html5/api/exitapi.js"> </script>
+`;
+}
+
+function renderTikTokSdk(platform) {
+  if (platform !== 'tiktok') {
+    return '';
+  }
+  return `
+  <script src="https://sf16-muse-va.ibytedtos.com/obj/union-fe-nc-i18n/Playable/sdk/Playable-sdk.js"></script>
 `;
 }
 
@@ -738,7 +753,12 @@ ${styleCss}
     window.progress = document.getElementById("loading-value");
     window.progress.value = 5;
   </script>
-  <canvas id="GameCanvas" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>
+  <div id="GameDiv" cc_exact_fit_screen="true">
+    <div id="Cocos3dGameContainer">
+      <canvas id="GameCanvas" oncontextmenu="event.preventDefault()" tabindex="99"></canvas>
+    </div>
+  </div>
+${renderTikTokSdk(platform)}
 
   <script>
 ${escapeScriptContent(polyfills)}
