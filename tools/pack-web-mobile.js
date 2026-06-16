@@ -2,15 +2,24 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const os = require('os');
 const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const INPUT_DIR = path.join(ROOT, 'web-mobile');
 const OUTPUT_DIR = path.join(ROOT, 'output');
 const OUTPUT_HTML = path.join(OUTPUT_DIR, 'index.html');
+const PACK_PLATFORMS = ['default', 'facebook', 'google', 'tiktok', 'applovin'];
+const PACK_CONFIG = loadPackConfig();
 const MINIFY_JS = process.env.MINIFY_JS !== '0';
 const EXTREME_PACK = process.env.EXTREME_PACK !== '0';
 const EXTREME_PACK_MIN_BYTES = 1024;
+const OPTIMIZE_WEBP = process.env.OPTIMIZE_WEBP !== '0';
+const WEBP_QUALITY = clampNumber(Number(process.env.WEBP_QUALITY || 70), 1, 100);
+const WEBP_ALPHA_QUALITY = clampNumber(Number(process.env.WEBP_ALPHA_QUALITY || 60), 1, 100);
+const WEBP_MIN_BYTES = Number(process.env.WEBP_MIN_BYTES || 4096);
+const WEBP_ENCODER = process.env.WEBP_ENCODER || 'cwebp';
+const APPLOVIN_CLICK_URL = process.env.APPLOVIN_CLICK_URL || PACK_CONFIG.applovinClickUrl || '';
 
 function log(message) {
   console.log(`[pack] ${message}`);
@@ -29,6 +38,23 @@ function formatMB(bytes) {
 function formatDuration(ms) {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
+}
+
+function loadPackConfig() {
+  const configPath = path.join(ROOT, 'tools', 'pack-config.json');
+  if (!fs.existsSync(configPath)) {
+    return {};
+  }
+  try {
+    return JSON.parse(readText(configPath));
+  } catch (err) {
+    throw new Error(`读取打包配置失败: ${configPath}\n${err.message}`);
+  }
 }
 
 async function step(label, fn) {
@@ -59,6 +85,9 @@ function askQuestion(question) {
 
 async function selectPlatform() {
   const envPlatform = (process.env.PACK_PLATFORM || '').trim().toLowerCase();
+  if (envPlatform === 'all' || envPlatform === '6') {
+    return 'all';
+  }
   if (envPlatform === 'default' || envPlatform === '1') {
     return 'default';
   }
@@ -71,15 +100,22 @@ async function selectPlatform() {
   if (envPlatform === 'tiktok' || envPlatform === '4') {
     return 'tiktok';
   }
+  if (envPlatform === 'applovin' || envPlatform === '5') {
+    return 'applovin';
+  }
   console.log('请选择打包平台：');
   console.log('1. MTG');
   console.log('2. facebook');
   console.log('3. 谷歌');
   console.log('4. TikTok');
+  console.log('5. AppLovin');
+  console.log('6. 一键全打包');
   const answer = (await askQuestion('请输入序号，直接回车默认选择 1（MTG）：')).trim();
   if (answer === '2') return 'facebook';
   if (answer === '3') return 'google';
   if (answer === '4') return 'tiktok';
+  if (answer === '5') return 'applovin';
+  if (answer === '6') return 'all';
   return 'default';
 }
 
@@ -87,7 +123,13 @@ function platformLabel(platform) {
   if (platform === 'facebook') return 'facebook';
   if (platform === 'google') return '谷歌';
   if (platform === 'tiktok') return 'TikTok';
+  if (platform === 'applovin') return 'AppLovin';
   return 'MTG';
+}
+
+function platformOutputName(platform) {
+  if (platform === 'default') return 'MTG';
+  return platform;
 }
 
 function readText(filePath) {
@@ -216,6 +258,31 @@ function renderGoogleRuntimeShim(platform) {
       }
       console.error('ExitApi.exit is not available');
     };
+  </script>
+`;
+}
+
+function renderAppLovinRuntimeShim(platform) {
+  if (platform !== 'applovin') {
+    return '';
+  }
+  return `
+  <script>
+    (function installAppLovinRuntimeShim() {
+      var clickUrl = ${safeJson(APPLOVIN_CLICK_URL)};
+      window.APPLOVIN_CLICK_URL = clickUrl;
+      window.install = function () {
+        if (!clickUrl) {
+          console.error('APPLOVIN_CLICK_URL is empty');
+          return;
+        }
+        if (window.mraid && typeof window.mraid.open === 'function') {
+          window.mraid.open(clickUrl);
+          return;
+        }
+        console.error('mraid.open is not available');
+      };
+    })();
   </script>
 `;
 }
@@ -477,7 +544,7 @@ function renderFacebookRuntimeShim(platform) {
 }
 
 function renderBodyPlatformShim(platform) {
-  return `${renderFacebookRuntimeShim(platform)}${renderGoogleRuntimeShim(platform)}`;
+  return `${renderFacebookRuntimeShim(platform)}${renderGoogleRuntimeShim(platform)}${renderAppLovinRuntimeShim(platform)}`;
 }
 
 function loadTerser() {
@@ -551,6 +618,7 @@ function walkFiles(dir) {
 function mimeFor(ext) {
   switch (ext) {
     case '.png': return 'image/png';
+    case '.webp': return 'image/webp';
     case '.jpg':
     case '.jpeg': return 'image/jpeg';
     case '.gif': return 'image/gif';
@@ -563,6 +631,87 @@ function mimeFor(ext) {
   }
 }
 
+function createWebpStats() {
+  return {
+    enabled: OPTIMIZE_WEBP,
+    quality: WEBP_QUALITY,
+    alphaQuality: WEBP_ALPHA_QUALITY,
+    minBytes: WEBP_MIN_BYTES,
+    attempted: 0,
+    converted: 0,
+    skippedSmall: 0,
+    failed: 0,
+    rawBytes: 0,
+    webpBytes: 0
+  };
+}
+
+let webpEncoderWarningShown = false;
+
+function encodePngToWebp(filePath, inputSize, webpStats) {
+  if (!OPTIMIZE_WEBP || inputSize < WEBP_MIN_BYTES) {
+    if (OPTIMIZE_WEBP && inputSize < WEBP_MIN_BYTES) {
+      webpStats.skippedSmall++;
+    }
+    return null;
+  }
+
+  webpStats.attempted++;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pack-webp-'));
+  const outPath = path.join(tempDir, `${path.basename(filePath)}.webp`);
+  try {
+    const result = spawnSync(WEBP_ENCODER, [
+      '-quiet',
+      '-q',
+      String(WEBP_QUALITY),
+      '-alpha_q',
+      String(WEBP_ALPHA_QUALITY),
+      filePath,
+      '-o',
+      outPath
+    ], {
+      encoding: 'utf8',
+      maxBuffer: 10 * 1024 * 1024
+    });
+
+    if (result.error) {
+      if (!webpEncoderWarningShown) {
+        log(`WebP 编码器不可用，跳过图片优化: ${result.error.message}`);
+        webpEncoderWarningShown = true;
+      }
+      webpStats.failed++;
+      return null;
+    }
+    if (result.status !== 0 || !fs.existsSync(outPath)) {
+      webpStats.failed++;
+      return null;
+    }
+
+    const webp = fs.readFileSync(outPath);
+    if (webp.length >= inputSize) {
+      return null;
+    }
+
+    webpStats.converted++;
+    webpStats.rawBytes += inputSize;
+    webpStats.webpBytes += webp.length;
+    return webp;
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function buildInlineAsset(filePath, ext, webpStats) {
+  const bin = fs.readFileSync(filePath);
+  if (ext === '.png') {
+    const webp = encodePngToWebp(filePath, bin.length, webpStats);
+    if (webp) {
+      return `data:image/webp;base64,${webp.toString('base64')}`;
+    }
+  }
+  return `data:${mimeFor(ext)};base64,${bin.toString('base64')}`;
+}
+
 function buildResMap() {
   const assetsRoot = path.join(INPUT_DIR, 'assets');
   const bundleNames = fs.readdirSync(assetsRoot, { withFileTypes: true })
@@ -570,6 +719,7 @@ function buildResMap() {
     .map(e => e.name);
   const files = walkFiles(assetsRoot);
   const resMap = {};
+  const webpStats = createWebpStats();
   for (const filePath of files) {
     const rel = path.relative(assetsRoot, filePath).split(path.sep).join('/');
     const ext = path.extname(filePath).toLowerCase();
@@ -580,15 +730,13 @@ function buildResMap() {
   if (ext === '.json' || ext === '.atlas' || ext === '.plist') {
     resMap[rel] = readText(filePath);
   } else {
-    const bin = fs.readFileSync(filePath);
-    const b64 = bin.toString('base64');
-    resMap[rel] = `data:${mimeFor(ext)};base64,${b64}`;
+    resMap[rel] = buildInlineAsset(filePath, ext, webpStats);
     if (rel.startsWith('native/')) {
       resMap[rel.replace(/^native\//, 'import/')] = resMap[rel];
     }
   }
   }
-  return { resMap, bundleNames };
+  return { resMap, bundleNames, webpStats };
 }
 
 function addWasmAlias(wasmMap, key, value) {
@@ -661,19 +809,19 @@ function buildSettings() {
   return settings;
 }
 
-async function main() {
+async function buildPlatform(platform, outputHtml) {
   if (!fs.existsSync(INPUT_DIR)) {
     console.error('Input not found:', INPUT_DIR);
     process.exit(1);
   }
 
-  const platform = await selectPlatform();
   const totalStarted = Date.now();
   log(`输入目录: ${INPUT_DIR}`);
-  log(`输出文件: ${OUTPUT_HTML}`);
+  log(`输出文件: ${outputHtml}`);
   log(`打包平台: ${platformLabel(platform)}`);
   log(`JS 压缩: ${MINIFY_JS ? '开启' : '关闭'}`);
   log(`极限压缩: ${EXTREME_PACK ? '开启' : '关闭'}`);
+  log(`WebP 图片优化: ${OPTIMIZE_WEBP ? `开启，quality=${WEBP_QUALITY}, alpha=${WEBP_ALPHA_QUALITY}, min=${formatBytes(WEBP_MIN_BYTES)}` : '关闭'}`);
 
   const styleCss = await step('读取 style.css', () => readText(path.join(INPUT_DIR, 'style.css')));
   const polyfills = await step('处理 polyfills.bundle.js', () => minifyJs(readJs(path.join('src', 'polyfills.bundle.js')), 'polyfills.bundle.js'));
@@ -681,8 +829,12 @@ async function main() {
 
   const settings = await step('处理 settings.json', () => buildSettings());
 
-  const { resMap, bundleNames } = await step('内联 assets 资源', () => buildResMap());
+  const { resMap, bundleNames, webpStats } = await step('内联 assets 资源', () => buildResMap());
   log(`资源 bundle: ${bundleNames.join(', ') || '无'}, 文件数: ${Object.keys(resMap).length}`);
+  if (webpStats.enabled) {
+    const savedBytes = webpStats.rawBytes - webpStats.webpBytes;
+    log(`WebP 优化: 尝试 ${webpStats.attempted} 张，转换 ${webpStats.converted} 张，小图跳过 ${webpStats.skippedSmall} 张，失败 ${webpStats.failed} 张，节省 ${formatBytes(savedBytes)}`);
+  }
   const wasmMap = await step('内联 wasm/bin 资源', () => buildWasmMap(platform));
   log(`wasm/bin 文件数: ${Object.keys(wasmMap).length}`);
 
@@ -1016,6 +1168,7 @@ window.hook = function (cc) {
   cc.assetManager.downloader.register('.bin', downloadArrayBuffer);
   cc.assetManager.downloader.register('.cconb', downloadCCONB);
   cc.assetManager.downloader.register('.png', downloadDomImage);
+  cc.assetManager.downloader.register('.webp', downloadDomImage);
   cc.assetManager.downloader.register('.jpg', downloadDomImage);
   cc.assetManager.downloader.register('.gif', downloadDomImage);
   cc.assetManager.downloader.register('.json', downloadJson);
@@ -1248,12 +1401,30 @@ ${renderBodyPlatformShim(platform)}
 </html>
 `;
 
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  fs.writeFileSync(OUTPUT_HTML, '\uFEFF' + html, 'utf8');
-  const outputSize = fs.statSync(OUTPUT_HTML).size;
-  log(`写入 ${OUTPUT_HTML}`);
+  fs.mkdirSync(path.dirname(outputHtml), { recursive: true });
+  fs.writeFileSync(outputHtml, '\uFEFF' + html, 'utf8');
+  const outputSize = fs.statSync(outputHtml).size;
+  log(`写入 ${outputHtml}`);
   log(`产物大小: ${formatMB(outputSize)}`);
   log(`全部完成 (${formatDuration(Date.now() - totalStarted)})`);
+}
+
+async function main() {
+  const selectedPlatform = await selectPlatform();
+
+  if (selectedPlatform === 'all') {
+    log('打包模式: 一键全打包');
+    const totalStarted = Date.now();
+    for (const platform of PACK_PLATFORMS) {
+      const outputHtml = path.join(OUTPUT_DIR, platformOutputName(platform), 'index.html');
+      await buildPlatform(platform, outputHtml);
+    }
+    log(`一键全打包完成 (${formatDuration(Date.now() - totalStarted)})`);
+    return;
+  }
+
+  log('打包模式: 单平台');
+  await buildPlatform(selectedPlatform, OUTPUT_HTML);
 }
 
 main().catch((err) => {
