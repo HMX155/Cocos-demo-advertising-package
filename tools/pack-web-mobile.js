@@ -9,7 +9,8 @@ const ROOT = path.resolve(__dirname, '..');
 const INPUT_DIR = path.join(ROOT, 'web-mobile');
 const OUTPUT_DIR = path.join(ROOT, 'output');
 const OUTPUT_HTML = path.join(OUTPUT_DIR, 'index.html');
-const PACK_PLATFORMS = ['default', 'facebook', 'google', 'tiktok', 'applovin'];
+const PACK_PLATFORMS = ['default', 'facebook', 'google', 'tiktok', 'applovin', 'moloco'];
+const MOLOCO_MAX_BYTES = 5 * 1000 * 1000;
 const PACK_CONFIG = loadPackConfig();
 const MINIFY_JS = process.env.MINIFY_JS !== '0';
 const EXTREME_PACK = process.env.EXTREME_PACK !== '0';
@@ -85,7 +86,7 @@ function askQuestion(question) {
 
 async function selectPlatform() {
   const envPlatform = (process.env.PACK_PLATFORM || '').trim().toLowerCase();
-  if (envPlatform === 'all' || envPlatform === '6') {
+  if (envPlatform === 'all' || envPlatform === '0') {
     return 'all';
   }
   if (envPlatform === 'default' || envPlatform === '1') {
@@ -103,19 +104,24 @@ async function selectPlatform() {
   if (envPlatform === 'applovin' || envPlatform === '5') {
     return 'applovin';
   }
+  if (envPlatform === 'moloco' || envPlatform === '6') {
+    return 'moloco';
+  }
   console.log('请选择打包平台：');
+  console.log('0. 一键全打包');
   console.log('1. MTG');
   console.log('2. facebook');
   console.log('3. 谷歌');
   console.log('4. TikTok');
   console.log('5. AppLovin');
-  console.log('6. 一键全打包');
+  console.log('6. Moloco');
   const answer = (await askQuestion('请输入序号，直接回车默认选择 1（MTG）：')).trim();
   if (answer === '2') return 'facebook';
   if (answer === '3') return 'google';
   if (answer === '4') return 'tiktok';
   if (answer === '5') return 'applovin';
-  if (answer === '6') return 'all';
+  if (answer === '0') return 'all';
+  if (answer === '6') return 'moloco';
   return 'default';
 }
 
@@ -124,6 +130,7 @@ function platformLabel(platform) {
   if (platform === 'google') return '谷歌';
   if (platform === 'tiktok') return 'TikTok';
   if (platform === 'applovin') return 'AppLovin';
+  if (platform === 'moloco') return 'Moloco';
   return 'MTG';
 }
 
@@ -285,6 +292,184 @@ function renderAppLovinRuntimeShim(platform) {
     })();
   </script>
 `;
+}
+
+function renderMolocoRuntimeShim(platform) {
+  if (platform !== 'moloco') return '';
+  return `
+  <script>
+    (function installMolocoRuntimeShim() {
+      var ctaPending = false;
+      window.install = function () {
+        if (ctaPending) return;
+        if (!window.FbPlayableAd || typeof window.FbPlayableAd.onCTAClick !== 'function') {
+          console.error('FbPlayableAd.onCTAClick is not available');
+          return;
+        }
+        ctaPending = true;
+        setTimeout(function () { ctaPending = false; }, 0);
+        window.FbPlayableAd.onCTAClick();
+      };
+      window.fbPlayableCTAClick = window.install;
+      window.openAppStore = window.install;
+      // 游戏代码通过此入口调用 CTA，避免同时调用 install 时重复跳转。
+      window.MolocoPlayableAd = { onCTAClick: window.install };
+
+      function resolveInlineResource(url) {
+        var key = String(url || '');
+        if (key.indexOf('data:') === 0) return key;
+        key = key.split('?')[0].split('#')[0];
+        try { key = new URL(key, window.location.href).pathname; } catch (err) {}
+        key = key.replace(/^\\/+/, '');
+        var wasmMap = window.wasmMap || {};
+        var keys = [key, key.replace(/^.*?cocos-js\\//, ''), key.split('/').pop()];
+        var assetIndex = key.lastIndexOf('/assets/');
+        if (assetIndex >= 0) keys.push(key.slice(assetIndex + 1));
+        for (var i = 0; i < keys.length; i++) {
+          if (Object.prototype.hasOwnProperty.call(wasmMap, keys[i])) return wasmMap[keys[i]];
+        }
+        var baseName = key.split('/').pop();
+        if (/^spine\\.(js\\.mem|wasm)$/.test(baseName)) {
+          var wasmKeys = Object.keys(wasmMap);
+          for (var j = 0; j < wasmKeys.length; j++) {
+            if (wasmKeys[j].split('/').pop().indexOf(baseName + '-') === 0) {
+              return wasmMap[wasmKeys[j]];
+            }
+          }
+        }
+        var assetName = resolveAssetName(key);
+        if (window.resMap && Object.prototype.hasOwnProperty.call(window.resMap, assetName)) {
+          return window.resMap[assetName];
+        }
+        throw new Error('Moloco 缺少内联资源: ' + url);
+      }
+
+      function inlineResourceToBlob(value) {
+        if (value.indexOf('data:') !== 0) return new Blob([value]);
+        var comma = value.indexOf(',');
+        var meta = value.slice(0, comma);
+        var data = value.slice(comma + 1);
+        var mime = meta.slice(5).split(';')[0];
+        if (meta.indexOf(';base64') < 0) {
+          return new Blob([decodeURIComponent(data)], { type: mime });
+        }
+        var binary = atob(data);
+        var bytes = new Uint8Array(binary.length);
+        for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new Blob([bytes], { type: mime });
+      }
+
+      // 仅从资源映射读取数据，不创建浏览器网络请求。
+      window.MolocoInlineRequest = function () {
+        this.readyState = 0;
+        this.status = 0;
+        this.responseType = '';
+        this.response = null;
+        this.responseText = '';
+        this.listeners = {};
+      };
+      var request = window.MolocoInlineRequest.prototype;
+      request.notify = function (type) {
+        var event = { type: type, target: this, currentTarget: this };
+        if (typeof this['on' + type] === 'function') this['on' + type](event);
+        (this.listeners[type] || []).slice().forEach(function (handler) { handler(event); });
+      };
+      request.open = function (method, url, async) {
+        if (String(method).toUpperCase() !== 'GET' || async === false) {
+          throw new Error('Moloco 仅支持异步读取内联资源');
+        }
+        this.url = url;
+        this.aborted = false;
+        this.readyState = 1;
+        this.notify('readystatechange');
+      };
+      request.send = function () {
+        var self = this;
+        Promise.resolve().then(function () {
+          return inlineResourceToBlob(resolveInlineResource(self.url));
+        }).then(function (blob) {
+          if (self.responseType === 'blob') return blob;
+          if (self.responseType === 'arraybuffer') return blob.arrayBuffer();
+          return blob.text().then(function (text) {
+            self.responseText = text;
+            return self.responseType === 'json' ? JSON.parse(text) : text;
+          });
+        }).then(function (response) {
+          if (self.aborted) return;
+          self.response = response;
+          self.status = 200;
+          self.readyState = 4;
+          self.notify('readystatechange');
+          self.notify('load');
+          self.notify('loadend');
+        }, function (err) {
+          if (self.aborted) return;
+          console.error(err);
+          self.status = 0;
+          self.readyState = 4;
+          self.notify('readystatechange');
+          self.notify('error');
+          self.notify('loadend');
+        });
+      };
+      request.abort = function () {
+        this.aborted = true;
+        this.readyState = 0;
+        this.status = 0;
+        this.notify('abort');
+        this.notify('loadend');
+      };
+      request.setRequestHeader = request.overrideMimeType = function () {};
+      request.addEventListener = function (type, handler) {
+        if (!this.listeners[type]) this.listeners[type] = [];
+        this.listeners[type].push(handler);
+      };
+      request.removeEventListener = function (type, handler) {
+        var list = this.listeners[type] || [];
+        var index = list.indexOf(handler);
+        if (index >= 0) list.splice(index, 1);
+      };
+      window.fetch = function (input) {
+        return Promise.resolve().then(function () {
+          var url = typeof input === 'string' ? input : input && input.url;
+          return new Response(inlineResourceToBlob(resolveInlineResource(url)));
+        });
+      };
+    })();
+  </script>
+`;
+}
+
+function preparePlatformJs(text, platform) {
+  if (platform !== 'moloco') return text;
+  const hasRedirect = /(?<![\w$.])(?:(?:window|document)\s*\.\s*)?location\s*\.\s*(?:href\s*=(?!=)|(?:assign|replace)\s*\()/i.test(text)
+    || /\b(?:window|document)\s*\.\s*location\s*=(?!=)/i.test(text);
+  if (/mraid\.js/i.test(text) || hasRedirect) {
+    throw new Error('Moloco 脚本包含 mraid.js 或 JavaScript 重定向，请先移除');
+  }
+  return text
+    .replace(/XMLHttpRequest/g, 'MolocoInlineRequest')
+    .replace(/\bFbPlayableAd\b/g, 'MolocoPlayableAd')
+    .replace(/\bwindow\.open\s*\(/g, 'window.install(');
+}
+
+function validateMolocoHtml(html) {
+  const size = Buffer.byteLength('\uFEFF' + html, 'utf8');
+  if (size >= MOLOCO_MAX_BYTES) {
+    throw new Error(`Moloco HTML 必须小于 5 MB（5,000,000 字节），当前 ${size} 字节，请减少资源或调整图片压缩质量`);
+  }
+  if (!html.includes('window.FbPlayableAd.onCTAClick()')) {
+    throw new Error('Moloco HTML 缺少无参数的 FbPlayableAd.onCTAClick()');
+  }
+  if (/XMLHttpRequest|mraid\.js/i.test(html)) {
+    throw new Error('Moloco HTML 包含不支持的网络接口或 mraid.js');
+  }
+  const markup = html.replace(/(<script\b[^>]*>)[\s\S]*?<\/script>/gi, '$1</script>');
+  if (/<(?:script|link|img|audio|video|source|iframe)\b[^>]*\b(?:src|href)\s*=\s*["'](?!(?:data:|blob:|#))[^"']+/i.test(markup)
+      || /url\s*\(\s*["']?(?!(?:data:|blob:|#))[^\s"')]+/i.test(markup)
+      || /@import\b/i.test(markup)) {
+    throw new Error('Moloco HTML 包含外部资源引用');
+  }
 }
 
 function renderFacebookRuntimeShim(platform) {
@@ -823,9 +1008,10 @@ async function buildPlatform(platform, outputHtml) {
   log(`极限压缩: ${EXTREME_PACK ? '开启' : '关闭'}`);
   log(`WebP 图片优化: ${OPTIMIZE_WEBP ? `开启，quality=${WEBP_QUALITY}, alpha=${WEBP_ALPHA_QUALITY}, min=${formatBytes(WEBP_MIN_BYTES)}` : '关闭'}`);
 
+  const processJs = (text, label) => minifyJs(preparePlatformJs(text, platform), label);
   const styleCss = await step('读取 style.css', () => readText(path.join(INPUT_DIR, 'style.css')));
-  const polyfills = await step('处理 polyfills.bundle.js', () => minifyJs(readJs(path.join('src', 'polyfills.bundle.js')), 'polyfills.bundle.js'));
-  const systemjs = await step('处理 system.bundle.js', () => minifyJs(readJs(path.join('src', 'system.bundle.js')), 'system.bundle.js'));
+  const polyfills = await step('处理 polyfills.bundle.js', () => processJs(readJs(path.join('src', 'polyfills.bundle.js')), 'polyfills.bundle.js'));
+  const systemjs = await step('处理 system.bundle.js', () => processJs(readJs(path.join('src', 'system.bundle.js')), 'system.bundle.js'));
 
   const settings = await step('处理 settings.json', () => buildSettings());
 
@@ -838,11 +1024,11 @@ async function buildPlatform(platform, outputHtml) {
   const wasmMap = await step('内联 wasm/bin 资源', () => buildWasmMap(platform));
   log(`wasm/bin 文件数: ${Object.keys(wasmMap).length}`);
 
-  const loadCCIndex = packScript('bundle-index.js', await step('处理 bundle index.js', () => minifyJs(buildLoadCCIndex(), 'loadCCIndex')));
+  const loadCCIndex = packScript('bundle-index.js', await step('处理 bundle index.js', () => processJs(buildLoadCCIndex(), 'loadCCIndex')));
 
-  const indexJs = packScript('index.js', await step('处理 index.js', () => minifyJs(readText(path.join(INPUT_DIR, 'index.js')), 'index.js')));
-  const bundleJs = packScript('bundle.js', await step('处理 bundle.js', () => minifyJs(readText(path.join(INPUT_DIR, 'src', 'chunks', 'bundle.js')), 'bundle.js')));
-  const ccJs = packScript('cc.js', await step('处理 cc.js', () => minifyJs(readText(path.join(INPUT_DIR, 'cocos-js', 'cc.js')), 'cc.js')));
+  const indexJs = packScript('index.js', await step('处理 index.js', () => processJs(readText(path.join(INPUT_DIR, 'index.js')), 'index.js')));
+  const bundleJs = packScript('bundle.js', await step('处理 bundle.js', () => processJs(readText(path.join(INPUT_DIR, 'src', 'chunks', 'bundle.js')), 'bundle.js')));
+  const ccJs = packScript('cc.js', await step('处理 cc.js', () => processJs(readText(path.join(INPUT_DIR, 'cocos-js', 'cc.js')), 'cc.js')));
 
   const spineFiles = fs.readdirSync(path.join(INPUT_DIR, 'cocos-js'))
     .filter(name => name.startsWith('spine') && name.endsWith('.js'))
@@ -858,7 +1044,7 @@ async function buildPlatform(platform, outputHtml) {
       const memPath = memMatch[0];
       js = `System.register([],(function(e){\"use strict\";return{execute:function(){e(\"default\",window.wasmMap[${JSON.stringify(memPath)}])}}}));`;
     }
-    js = await minifyJs(js, name);
+    js = await processJs(js, name);
     return { name, fnName, script: plainScript(name, js) };
   })));
   const packedEntries = [loadCCIndex, indexJs, bundleJs, ccJs].filter(s => s.packed);
@@ -875,6 +1061,7 @@ async function buildPlatform(platform, outputHtml) {
   <title>Playable Ads</title>
   <meta name="viewport" content="width=device-width,user-scalable=no,initial-scale=1, minimum-scale=1,maximum-scale=1" />
 ${renderHeadPlatformScripts(platform)}
+${renderMolocoRuntimeShim(platform)}
   <style>
     #loading-zone {
       position: absolute;
@@ -1401,6 +1588,9 @@ ${renderBodyPlatformShim(platform)}
 </html>
 `;
 
+  if (platform === 'moloco') {
+    await step('校验 Moloco 素材', () => validateMolocoHtml(html));
+  }
   fs.mkdirSync(path.dirname(outputHtml), { recursive: true });
   fs.writeFileSync(outputHtml, '\uFEFF' + html, 'utf8');
   const outputSize = fs.statSync(outputHtml).size;
